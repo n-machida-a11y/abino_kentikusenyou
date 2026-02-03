@@ -1,0 +1,134 @@
+// ----------------------------------------------------------------
+// アラート機能
+// ----------------------------------------------------------------
+
+/**
+ * 校正期限が近い物品をチェックし、メールで通知します。
+ * この関数を毎日実行するようにトリガー設定をしてください。
+ *
+ * ※このコードは、コード.gs で定義されている以下のグローバル定数に依存します:
+ * ss, itemSheet, rentalSheet, HEADER, HISTORY_HEADER
+ */
+function checkCalibrationDatesAndSendAlerts() {
+  const NOTIFICATION_DAYS_BEFORE = 30; // 30日前に通知
+  
+  // ★アプリのURLを貼り付け
+  const APP_URL = 'https://docs.google.com/spreadsheets/d/1E4qIni07qehnHV3f7SCne1pi90jrkQMMKHw8CNp37UM/edit?gid=806675927#gid=806675927';
+
+  // 定数設定を Code.gs と共有
+  const dateColIndex = HEADER.indexOf('校正日・入替日');
+  const nameColIndex = HEADER.indexOf('物品名');
+  const idColIndex = HEADER.indexOf('管理番号');
+  // ★追加: カテゴリ列インデックス
+  const categoryColIndex = HEADER.indexOf('カテゴリ'); 
+
+  if (dateColIndex === -1 || categoryColIndex === -1) {
+    console.error('必要な列（校正日・入替日、カテゴリ）が見つかりません。');
+    return;
+  }
+
+  const values = itemSheet.getLastRow() > 1 ? itemSheet.getRange(2, 1, itemSheet.getLastRow() - 1, HEADER.length).getValues() : [];
+  
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const targetDate = new Date(today);
+  targetDate.setDate(today.getDate() + NOTIFICATION_DAYS_BEFORE);
+
+  const expiringItems = [];
+
+  values.forEach(row => {
+    const calibDateValue = row[dateColIndex];
+    if (calibDateValue instanceof Date) {
+      const calibDate = new Date(calibDateValue);
+      calibDate.setHours(0, 0, 0, 0);
+
+      // 期限が今日からNOTIFICATION_DAYS_BEFORE日後の間に含まれるものを抽出
+      if (calibDate >= today && calibDate <= targetDate) {
+        expiringItems.push({
+          id: row[idColIndex],
+          name: row[nameColIndex],
+          date: Utilities.formatDate(calibDate, Session.getScriptTimeZone(), 'yyyy/MM/dd'),
+          category: row[categoryColIndex] // ★カテゴリ情報を追加
+        });
+      }
+    }
+  });
+
+  if (expiringItems.length > 0) {
+    // 抽出された物品のユニークなカテゴリリストを作成
+    const expiringCategories = [...new Set(expiringItems.map(item => item.category))];
+    
+    // 送信先アドレスを動的に取得
+    let recipientEmails = [];
+
+    // 1. メールマスタから取得
+    const mailMasterSheet = ss.getSheetByName('メールマスタ');
+    if (mailMasterSheet) {
+        // 取得する列を4列目（カテゴリ列）まで拡張
+        const mailValues = mailMasterSheet.getLastRow() > 1 
+          ? mailMasterSheet.getRange(2, 1, mailMasterSheet.getLastRow() - 1, 4).getValues() 
+          : [];
+        
+        // ★カテゴリによるフィルタリングロジックを適用
+        const matchingEmails = mailValues
+            .filter(row => {
+                const mailType = row[1]; // メール種類 (インデックス 1)
+                const address = row[2];  // アドレス (インデックス 2)
+                const categoryCondition = row[3]; // カテゴリ (インデックス 3)
+
+                // 1. メール種類が '校正期限' であること、およびアドレスが有効であること
+                if (mailType !== '校正期限' || !address || address.trim() === '') {
+                    return false;
+                }
+
+                // 2. カテゴリ条件のチェック（空白の場合は全カテゴリ対象）
+                if (!categoryCondition || categoryCondition.toString().trim() === '') {
+                    return true;
+                }
+
+                // カテゴリ条件をカンマ区切りで配列化し、トリムする
+                const requiredCategories = categoryCondition.toString().split(',')
+                    .map(c => c.trim())
+                    .filter(c => c.length > 0);
+                
+                // 抽出された物品のカテゴリと、メールマスタの指定カテゴリのいずれかが一致するかチェック
+                // 期限切れ物品のカテゴリがいずれか一つでも requiredCategories に含まれていればOK
+                return expiringCategories.some(expiringCat => requiredCategories.includes(expiringCat));
+            })
+            .map(row => row[2].trim()); // アドレス列を抽出
+
+        recipientEmails.push(...matchingEmails);
+    } else {
+        console.warn('「メールマスタ」シートが見つかりません。');
+    }
+
+    // 2. 重複を削除
+    const uniqueEmails = [...new Set(recipientEmails.filter(email => email.includes('@')))];
+
+    if (uniqueEmails.length === 0) {
+      console.log('期限切れの物品はありましたが、有効な送信先メールアドレスが見つかりませんでした。（カテゴリフィルタリングの結果、該当者なし）');
+      return;
+    }
+
+    let subject = '【貸与品管理】校正期限が近い物品のお知らせ';
+    let body = '以下の物品の校正・入替期限が近づいています。\n\n';
+    
+    expiringItems.sort((a, b) => new Date(a.date) - new Date(b.date)); // 日付順にソート
+
+    expiringItems.forEach(item => {
+      body += `・管理番号: ${item.id}\n`;
+      body += `  物品名: ${item.name}\n`;
+      body += `  カテゴリ: ${item.category}\n`; // ★カテゴリを本文に追加
+      body += `  期限日: ${item.date}\n\n`;
+    });
+    
+    // URLを固定値を使用するように変更
+    body += `貸与品管理アプリでご確認ください:\n${APP_URL}`;
+
+    MailApp.sendEmail(uniqueEmails.join(','), subject, body);
+    console.log(`${expiringItems.length}件の通知メールを ${uniqueEmails.length} 件のアドレスに送信しました。`);
+  } else {
+    console.log('通知対象の物品はありませんでした。');
+  }
+}
